@@ -3,6 +3,16 @@
 DXv3 Safari Agent Kernel
 FastAPI server — runs in Pythonista 3 on iPad
 Endpoints: /ingest /command /generate /reverse /memory
+
+WIRE-01 (2026-07-04):
+  safari_brain_publisher is now imported and called at every task completion
+  point so iPad agent activity is visible in brain.db via harmony bus:
+    /ingest   → publish_agent_result(task_type='ingest')
+    /generate → publish_agent_result(task_type='generate_script')
+    /reverse  → publish_agent_result(task_type='git_reverse')
+                + publish_kg_link for each chain_target discovered
+    /health   → publish_agent_ping(status='running')
+  Graceful no-op if harmony-engine-protocol is not installed on the device.
 """
 
 import json
@@ -23,6 +33,22 @@ except ImportError:
     from fastapi.responses import JSONResponse
     import uvicorn
 
+# ── Brain Bus (graceful — no-op if harmony not installed on this device) ───────
+try:
+    from safari_brain_publisher import (
+        publish_agent_result,
+        publish_agent_ping,
+        publish_kg_link,
+        bus_available,
+    )
+    _BRAIN_BUS = True
+except ImportError:
+    _BRAIN_BUS = False
+    def publish_agent_result(*a, **kw): return False   # type: ignore[misc]
+    def publish_agent_ping(*a, **kw):   return False   # type: ignore[misc]
+    def publish_kg_link(*a, **kw):      return False   # type: ignore[misc]
+    def bus_available():                return False   # type: ignore[misc]
+
 # ── Config ────────────────────────────────────────────────────────────────────
 PORT = 8000
 DB_PATH = str(Path.home() / 'Documents' / 'agent_memory.db')
@@ -32,7 +58,7 @@ USERSCRIPTS_DIR = '/private/var/mobile/Containers/Shared/AppGroup/'
 # Fallback path — update after first Userscripts app launch on your device
 FALLBACK_SCRIPTS_DIR = str(Path.home() / 'Documents' / 'GeneratedScripts')
 
-app = FastAPI(title='DXv3 Kernel', version='1.0.0')
+app = FastAPI(title='DXv3 Kernel', version='1.1.0')
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def get_db():
@@ -139,7 +165,19 @@ async def ingest(request: Request):
     )
     conn.commit()
     conn.close()
+
+    # ── WIRE-01: publish ingest event so brain tracks every page Safari visits ──
+    publish_agent_result(
+        task_id   = data.get('sessionId', 'ingest'),
+        task_type = 'ingest',
+        outcome   = 'pass',
+        detail    = f"domain={data.get('domain', '')}",
+        model     = '',
+        url       = data.get('url', ''),
+    )
+
     return {'status': 'ok', 'domain': data.get('domain')}
+
 
 @app.get('/command')
 async def command(session: str = '', url: str = ''):
@@ -168,6 +206,7 @@ async def command(session: str = '', url: str = ''):
     except Exception:
         return {'action': 'wait', 'payload': None}
 
+
 @app.post('/generate')
 async def generate(request: Request):
     data = await request.json()
@@ -175,6 +214,7 @@ async def generate(request: Request):
     context = data.get('context', '')
     prompt = f'TASK: {task}\n\nCONTEXT:\n{context}'
     script = llm(SCRIPT_GENERATOR_PROMPT, prompt, temperature=0.3)
+
     # Save to DB
     filename = f'generated_{datetime.now().strftime("%Y%m%d_%H%M%S")}.user.js'
     conn = get_db()
@@ -184,26 +224,64 @@ async def generate(request: Request):
     )
     conn.commit()
     conn.close()
+
     # Write to filesystem
     _write_script(filename, script)
+
+    # ── WIRE-01: publish script generation — outcome tracks LLM errors ──────────
+    outcome = 'fail' if script.startswith('LLM_ERROR') else 'pass'
+    publish_agent_result(
+        task_id   = filename,
+        task_type = 'generate_script',
+        outcome   = outcome,
+        detail    = f"task={task[:120]}",
+        model     = LLM_MODEL,
+        url       = '',
+    )
+
     return {'status': 'ok', 'filename': filename, 'script': script}
+
 
 @app.post('/reverse')
 async def reverse(request: Request):
     data = await request.json()
     repo_url = data.get('url', '')
+
     # Fetch via gitingest
     try:
         ingest_url = repo_url.replace('github.com', 'gitingest.com')
         raw = requests.get(ingest_url, timeout=30).text[:8000]
     except Exception as e:
         raw = f'FETCH_ERROR: {e}'
+
     result = llm(DECOMPOSER_PROMPT, raw)
     try:
         parsed = json.loads(result)
     except Exception:
         parsed = {'raw': result}
+
+    # ── WIRE-01: publish reverse event + KG edges for every chain_target ────────
+    outcome = 'fail' if ('FETCH_ERROR' in raw or 'LLM_ERROR' in raw) else 'pass'
+    publish_agent_result(
+        task_id   = repo_url,
+        task_type = 'git_reverse',
+        outcome   = outcome,
+        detail    = f"url={repo_url[:150]}",
+        model     = LLM_MODEL,
+        url       = repo_url,
+    )
+    if outcome == 'pass':
+        # Register KG edges: safari-agent-stack CHAIN_TARGET → discovered repos
+        for target in parsed.get('chain_targets', []):
+            if isinstance(target, str) and target.strip():
+                publish_kg_link(
+                    target_repo = target.strip(),
+                    relation    = 'CHAIN_TARGET',
+                    weight      = 1.0,
+                )
+
     return {'url': repo_url, 'decomposed': parsed}
+
 
 @app.get('/memory')
 async def memory(domain: str = '', limit: int = 20):
@@ -221,6 +299,7 @@ async def memory(domain: str = '', limit: int = 20):
     conn.close()
     return [dict(r) for r in rows]
 
+
 @app.post('/queue')
 async def queue_command(request: Request):
     """Manually queue a command for a session (for iOS Shortcut integration)"""
@@ -234,9 +313,18 @@ async def queue_command(request: Request):
     conn.close()
     return {'status': 'queued'}
 
+
 @app.get('/health')
 async def health():
-    return {'status': 'online', 'model': LLM_MODEL, 'db': DB_PATH}
+    # ── WIRE-01: subsystem heartbeat so the-brain dashboard shows safari online ──
+    publish_agent_ping(status='running')
+    return {
+        'status':     'online',
+        'model':      LLM_MODEL,
+        'db':         DB_PATH,
+        'brain_bus':  _BRAIN_BUS,
+    }
+
 
 # ── File Writer ───────────────────────────────────────────────────────────────
 def _write_script(filename: str, content: str):
@@ -246,9 +334,11 @@ def _write_script(filename: str, content: str):
     (out_dir / filename).write_text(content)
     print(f'[Kernel] Script written: {out_dir / filename}')
 
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print(f'[DXv3 Kernel] Starting on http://127.0.0.1:{PORT}')
     print(f'[DXv3 Kernel] DB: {DB_PATH}')
     print(f'[DXv3 Kernel] LLM: {LLM_BASE} ({LLM_MODEL})')
+    print(f'[DXv3 Kernel] Brain bus: {"connected" if _BRAIN_BUS else "offline (harmony not installed)"}')
     uvicorn.run(app, host='127.0.0.1', port=PORT, log_level='info')
